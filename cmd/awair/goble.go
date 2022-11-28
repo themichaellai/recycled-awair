@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,28 +13,6 @@ import (
 
 var awairServiceUUIDBle = ble.MustParse(awairServiceUUID)
 var awairCharacteristicUUID4Ble = ble.MustParse(awairCharacteristicUUID4)
-
-//func findAwair() (ble.Advertisement, error) {
-//	ctx, cancel := context.WithCancel(context.Background())
-//	defer cancel()
-//	resCh := make(chan ble.Advertisement)
-//	go func() {
-//		if err := ble.Scan(ctx, true, func(a ble.Advertisement) {
-//			if a.LocalName() == awairDeviceNme {
-//				resCh <- a
-//			}
-//		}, nil); err != nil {
-//			panic(err)
-//		}
-//	}()
-//
-//	select {
-//	case <-time.After(awairSearchTimeout):
-//		return nil, fmt.Errorf("timed out while scanning for awair")
-//	case a := <-resCh:
-//		return a, nil
-//	}
-//}
 
 func ctxWithTimeout() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), awairSearchTimeout)
@@ -116,13 +95,36 @@ func mustJson(m map[string]interface{}) []byte {
 	return bs
 }
 
+var errWaitForResp = fmt.Errorf("timed out while waiting for response")
+
 func waitForResp(jsonCh <-chan jsonResp) (jsonResp, error) {
+	return waitForRespWithTimeout(jsonCh, awaitRespTimeout)
+}
+
+func waitForRespWithTimeout(jsonCh <-chan jsonResp, timeout time.Duration) (jsonResp, error) {
 	select {
-	case <-time.After(awaitRespTimeout):
-		return jsonResp{}, fmt.Errorf("timed out while waiting for response")
+	case <-time.After(timeout):
+		return jsonResp{}, errWaitForResp
 	case res := <-jsonCh:
 		return res, nil
 	}
+}
+
+func sendSimpleRequest(
+	client ble.Client,
+	char5 *ble.Characteristic,
+	jsonCh <-chan jsonResp,
+	req map[string]interface{},
+) error {
+	if err := client.WriteCharacteristic(char5, mustJson(req), false); err != nil {
+		return fmt.Errorf("couldn't send request: %s", err)
+	}
+	json, err := waitForResp(jsonCh)
+	if err != nil {
+		return fmt.Errorf("could not get response: %s", err)
+	}
+	fmt.Println(json.String())
+	return nil
 }
 
 func runGoble() error {
@@ -131,11 +133,6 @@ func runGoble() error {
 		return fmt.Errorf("can't new device: %s", err)
 	}
 	ble.SetDefaultDevice(d)
-
-	//fmt.Printf("Scanning for %s...\n", awairSearchTimeout)
-	//if _, err := findAwair(); err != nil {
-	//	return fmt.Errorf("can't find awair: %w", err)
-	//}
 
 	fmt.Println("Connecting to awair...")
 	ctx, cancel := ctxWithTimeout()
@@ -167,30 +164,63 @@ func runGoble() error {
 	}
 	fmt.Println(json.String())
 
-	if err := client.WriteCharacteristic(char5, mustJson(map[string]interface{}{
+	if err := sendSimpleRequest(client, char5, jsonCh, map[string]interface{}{
 		"cmd":          "set_country",
 		"country_code": "CN",
-	}), false); err != nil {
-		return fmt.Errorf("couldn't write country cmd: %w", err)
+	}); err != nil {
+		return fmt.Errorf("couldn't set country: %w", err)
 	}
-
-	json, err = waitForResp(jsonCh)
-	if err != nil {
-		return fmt.Errorf("did not get set country resp: %w", err)
-	}
-	fmt.Println(json.String())
 
 	fmt.Println("Setting up wifi...")
-	if err := client.WriteCharacteristic(char5, mustJson(map[string]interface{}{
+	if err := sendSimpleRequest(client, char5, jsonCh, map[string]interface{}{
 		"cmd": "wifi_setup",
+	}); err != nil {
+		return fmt.Errorf("couldn't set up wifi: %w", err)
+	}
+
+	fmt.Println("Connecting to network...")
+	if err := client.WriteCharacteristic(char5, mustJson(map[string]interface{}{
+		"SSID":     "",
+		"password": "",
+		"security": "WPA2 AES PSK",
 	}), false); err != nil {
-		return fmt.Errorf("couldn't write wifi setup cmd: %w", err)
+		return fmt.Errorf("couldn't connect to wifi: %w", err)
 	}
-	json, err = waitForResp(jsonCh)
-	if err != nil {
-		return fmt.Errorf("did not get wifi setup resp: %w", err)
+	for {
+		json, err = waitForRespWithTimeout(jsonCh, 30*time.Second)
+		if err != nil {
+			if errors.Is(err, errWaitForResp) {
+				return fmt.Errorf("timed out waiting for wifi response")
+			}
+			return fmt.Errorf("could not get wifi connect resp: %w", err)
+		}
+		fmt.Println(json.String())
+		if json.obj["state"] == "OK" {
+			break
+		}
 	}
-	fmt.Println(json.String())
+
+	fmt.Println("Doing connection test...")
+	if err := sendSimpleRequest(client, char5, jsonCh, map[string]interface{}{
+		"cmd": "connection_test",
+	}); err != nil {
+		return fmt.Errorf("could not do connection test: %w", err)
+	}
+
+	fmt.Println("Registering device...")
+	if err := sendSimpleRequest(client, char5, jsonCh, map[string]interface{}{
+		"cmd": "device_register",
+	}); err != nil {
+		return fmt.Errorf("could not register device: %w", err)
+	}
+
+	fmt.Println("Setting mqtt token...")
+	if err := sendSimpleRequest(client, char5, jsonCh, map[string]interface{}{
+		"cmd":        "set_mqtt_token",
+		"mqtt_token": "", // TODO: JWT pulled from /register-device endpoint
+	}); err != nil {
+		return fmt.Errorf("could not register device: %w", err)
+	}
 
 	return nil
 }
